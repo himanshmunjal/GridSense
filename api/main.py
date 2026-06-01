@@ -95,7 +95,7 @@ def _load_models():
 
     for z in ZONES:
         # Forecaster
-        fc = DemandForecaster(input_size=1, hidden_size=128, num_layers=2,
+        fc = DemandForecaster(input_size=10, hidden_size=128, num_layers=2,
                                output_steps=HORIZON, dropout=0.2)
         fc.load_state_dict(torch.load(SAVED_DIR / f"forecaster_zone_{z}.pt",
                                        map_location=DEVICE))
@@ -126,26 +126,77 @@ def _load_models():
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-def get_latest_window(zone_id: int) -> np.ndarray:
-    """
-    Get the last 48 hours of normalized demand for a zone.
-    In production this would query a real-time database.
-    Here we take the last LOOKBACK rows of the test set.
-    """
-    df = zone_data[zone_id]
+# def get_latest_window(zone_id: int) -> np.ndarray:
+#     """
+#     Get the last 48 hours of normalized demand for a zone.
+#     In production this would query a real-time database.
+#     Here we take the last LOOKBACK rows of the test set.
+#     """
+#     df = zone_data[zone_id]
+#     scaler = scalers[zone_id]
+
+#     # Take last LOOKBACK + HORIZON rows from test portion (last 15%)
+#     n = len(df)
+#     test_start = int(n * 0.85)
+#     recent = df.iloc[-(LOOKBACK + HORIZON):-HORIZON]["demand_kwh"].values
+    
+#     if len(recent) < LOOKBACK:
+#         recent = df.iloc[-LOOKBACK:]["demand_kwh"].values
+
+#     normalized = scaler.transform(recent.reshape(-1, 1)).flatten()
+#     return normalized  # (LOOKBACK,)
+
+def get_latest_window(zone_id: int):
+    df = zone_data[zone_id].copy()
     scaler = scalers[zone_id]
 
-    # Take last LOOKBACK + HORIZON rows from test portion (last 15%)
-    n = len(df)
-    test_start = int(n * 0.85)
-    recent = df.iloc[-(LOOKBACK + HORIZON):-HORIZON]["demand_kwh"].values
-    
-    if len(recent) < LOOKBACK:
-        recent = df.iloc[-LOOKBACK:]["demand_kwh"].values
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").set_index("datetime")
 
-    normalized = scaler.transform(recent.reshape(-1, 1)).flatten()
-    return normalized  # (LOOKBACK,)
+    df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
 
+    df["dow_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+
+    df["demand_lag24"] = df["demand_kwh"].shift(24)
+    df["demand_lag168"] = df["demand_kwh"].shift(168)
+
+    df["rolling_mean_24"] = df["demand_kwh"].rolling(24).mean()
+    df["rolling_std_24"] = df["demand_kwh"].rolling(24).std()
+    df["rolling_mean_168"] = df["demand_kwh"].rolling(168).mean()
+
+    df = df.dropna()
+
+    SCALE_COLS = [
+        "demand_kwh",
+        "demand_lag24",
+        "demand_lag168",
+        "rolling_mean_24",
+        "rolling_std_24",
+        "rolling_mean_168",
+    ]
+
+    FEATURE_COLS = [
+        "demand_kwh",
+        "demand_lag24",
+        "demand_lag168",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos",
+        "rolling_mean_24",
+        "rolling_std_24",
+        "rolling_mean_168",
+    ]
+
+    recent = df.iloc[-LOOKBACK:].copy()
+
+    recent[SCALE_COLS] = scaler.transform(
+        recent[SCALE_COLS]
+    )
+
+    return recent[FEATURE_COLS].values.astype(np.float32)
 
 # ─── RESPONSE MODELS ──────────────────────────────────────────────────────────
 
@@ -189,15 +240,20 @@ def get_forecast(zone: int = 1):
 
     # Get input window
     window = get_latest_window(zone)
-    X = torch.FloatTensor(window).unsqueeze(0).unsqueeze(-1)  # (1, 48, 1)
+    X = torch.FloatTensor(window).unsqueeze(0)  # (1, 48, 1)
 
     # MC Dropout inference
     mean, lower, upper = predict_with_uncertainty(model, X, n_samples=50, device=DEVICE)
 
     # Inverse transform to kWh
-    mean_kwh  = scaler.inverse_transform(mean.squeeze().numpy().reshape(-1, 1)).flatten()
-    lower_kwh = scaler.inverse_transform(lower.squeeze().numpy().reshape(-1, 1)).flatten()
-    upper_kwh = scaler.inverse_transform(upper.squeeze().numpy().reshape(-1, 1)).flatten()
+    demand_mean = scaler.mean_[0]
+    demand_std = scaler.scale_[0]
+
+    mean_kwh = mean.squeeze().numpy() * demand_std + demand_mean
+    lower_kwh = lower.squeeze().numpy() * demand_std + demand_mean
+    upper_kwh = upper.squeeze().numpy() * demand_std + demand_mean
+    # lower_kwh = scaler.inverse_transform(lower.squeeze().numpy().reshape(-1, 1)).flatten()
+    # upper_kwh = scaler.inverse_transform(upper.squeeze().numpy().reshape(-1, 1)).flatten()
 
     # Generate future timestamps (next 24h from last known timestamp)
     last_ts = pd.to_datetime(df.iloc[-1]["datetime"])
@@ -239,7 +295,13 @@ def get_anomalies(zone: int = 1, lookback_hours: int = 168):
 
     # Get recent data
     recent = df.iloc[-lookback_hours:].reset_index(drop=True)
-    values = scaler.transform(recent["demand_kwh"].values.reshape(-1, 1)).flatten()
+    # values = scaler.transform(recent["demand_kwh"].values.reshape(-1, 1)).flatten()
+    demand_mean = scaler.mean_[0]
+    demand_std = scaler.scale_[0]
+
+    values = (
+        recent["demand_kwh"].values - demand_mean
+    ) / demand_std
 
     anomaly_events = []
 
