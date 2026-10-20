@@ -1,0 +1,9 @@
+torch>=2.2
+numpy>=1.26
+pandas>=2.1
+scikit-learn>=1.4
+lightgbm>=4.3
+holidays>=0.50
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
