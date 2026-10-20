@@ -3,8 +3,9 @@ models/autoencoder.py
 ─────────────────────
 PURPOSE:
   LSTM Autoencoder for unsupervised anomaly detection.
-  Trained on NORMAL consumption windows only (demand signal, 1 channel).
-  At inference: flag windows with high reconstruction error as anomalies.
+  Trained on NORMAL consumption windows only (log demand signal, 1 channel).
+  At inference: score every HOUR by its reconstruction error and flag hours
+  above a calibrated threshold.
 
 HOW IT WORKS:
   Encoder: (batch, seq_len, 1) → compressed latent vector (batch, latent_dim)
@@ -22,25 +23,29 @@ WHY DEMAND-ONLY INPUT (input_size=1):
   are caused only by abnormal consumption patterns, not noise from trivially
   reconstructable channels.
 
+POINT-LEVEL SCORING:
+  Anomalies are single hours, so we score hours, not windows. Every hour is
+  covered by up to `seq_len` overlapping windows; its score is the mean
+  squared reconstruction error at that position across those windows.
+  Averaging an error over the whole 48h window would dilute a single spike
+  48×, and labelling a window by hours it doesn't contain is meaningless.
+
 THRESHOLD CALIBRATION:
-  After training, compute reconstruction error on ALL normal training windows.
-  Threshold = mean_error + sigma * std_error
-  Any test window exceeding this is flagged anomalous.
+  The threshold is the value that maximises F1 on the VALIDATION split's
+  hourly scores. The test split is never used for tuning.
 
-  WHY 2σ: assumes roughly Gaussian errors → ~5% false positive rate.
-  Tune sigma_multiplier up (fewer alerts, riskier) or down (more alerts) 
-  depending on grid operator risk tolerance.
-
-DATALOADER CONTRACT:
-  All DataLoaders here come from get_normal_only_loader() in train.py, which
-  yields 4-tuples: (X_full, X_demand, y, anomaly).
-  This file always unpacks index 1 (X_demand) — never index 0 (X_full).
+WHY a small latent (8):
+  A 32-dim latent for a 48-step window is a loose bottleneck — the model
+  can partly copy spikes through. A tighter bottleneck forces it to learn
+  only the typical daily shape, so anomalies reconstruct badly.
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
 from typing import Tuple
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import precision_recall_curve
 
 
 # ─── ENCODER ──────────────────────────────────────────────────────────────────
@@ -130,7 +135,7 @@ class LSTMAutoencoder(nn.Module):
         seq_len: int     = 48,
         input_size: int  = 1,     # always 1 — demand channel only
         hidden_size: int = 64,
-        latent_dim: int  = 32,
+        latent_dim: int  = 8,
         num_layers: int  = 1,
     ):
         super().__init__()
@@ -148,11 +153,42 @@ class LSTMAutoencoder(nn.Module):
         return self.decoder(latent)
 
 
+# ─── WINDOWS ──────────────────────────────────────────────────────────────────
+
+def make_windows(values: np.ndarray, seq_len: int) -> np.ndarray:
+    """(N,) hourly series → (N - seq_len + 1, seq_len, 1) stride-1 windows."""
+    windows = np.lib.stride_tricks.sliding_window_view(values, seq_len)
+    return windows[..., None].astype(np.float32)
+
+
+def make_normal_loader(
+    values: np.ndarray,
+    labels: np.ndarray,
+    seq_len: int,
+    batch_size: int = 128,
+    shuffle: bool = True,
+) -> DataLoader:
+    """
+    DataLoader over windows that contain NO labelled anomaly anywhere.
+
+    WHY use the labels on the whole window:
+      If a training window contains a spike, the autoencoder learns to
+      reconstruct spikes as "normal", which destroys detection capability.
+    """
+    windows = make_windows(values, seq_len)
+    dirty   = np.lib.stride_tricks.sliding_window_view(labels, seq_len).sum(axis=1) > 0
+    clean   = windows[~dirty]
+    print(f"  Normal windows: {len(clean)}/{len(windows)} "
+          f"({len(clean) / len(windows) * 100:.1f}%)")
+    return DataLoader(TensorDataset(torch.from_numpy(clean)),
+                      batch_size=batch_size, shuffle=shuffle)
+
+
 # ─── TRAINING ─────────────────────────────────────────────────────────────────
 
 def train_autoencoder(
     model: LSTMAutoencoder,
-    train_loader,         # normal-only DataLoader from get_normal_only_loader()
+    train_loader,         # normal-only DataLoader from make_normal_loader()
     val_loader,
     epochs: int   = 50,
     lr: float     = 1e-3,
@@ -162,10 +198,7 @@ def train_autoencoder(
     """
     Train the autoencoder to reconstruct normal demand windows.
 
-    DataLoader contract: yields 4-tuples (X_full, X_demand, y, anomaly).
-    We unpack index 1 (X_demand) — the single-channel demand signal.
-    Index 0 (X_full) is the 10-feature forecaster input and must NOT be used
-    here: feeding time-encoding channels would dilute reconstruction error.
+    DataLoader contract: yields 1-tuples (X_demand,) of shape (batch, seq_len, 1).
 
     Early stopping restores the best validation weights to prevent overfitting
     on the small number of "normal-only" windows.
@@ -186,15 +219,12 @@ def train_autoencoder(
         # ── TRAIN ──────────────────────────────────────────────────────────
         model.train()
         train_losses = []
-        for batch in train_loader:
-            # Unpack index 1: X_demand (batch, seq_len, 1)
-            # Index 0 is X_full (10 features) — wrong input for the autoencoder
-            _, X_demand, _, _ = batch
+        for (X_demand,) in train_loader:
             X_demand = X_demand.to(device)
 
             optimizer.zero_grad()
             recon = model(X_demand)
-            loss  = criterion(recon, X_demand)   # reconstruct the INPUT, not y
+            loss  = criterion(recon, X_demand)   # reconstruct the INPUT
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -204,8 +234,7 @@ def train_autoencoder(
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for batch in val_loader:
-                _, X_demand, _, _ = batch
+            for (X_demand,) in val_loader:
                 X_demand = X_demand.to(device)
                 recon    = model(X_demand)
                 val_losses.append(criterion(recon, X_demand).item())
@@ -236,85 +265,83 @@ def train_autoencoder(
     return model
 
 
-# ─── THRESHOLD CALIBRATION ────────────────────────────────────────────────────
+# ─── HOURLY SCORING ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def calibrate_threshold(
+def score_series(
     model: LSTMAutoencoder,
-    normal_loader,          # normal-only DataLoader (same as training loader)
+    values: np.ndarray,       # (N,) scaled log demand
     device: str = "cpu",
-    sigma_multiplier: float = 2.0,
+    batch_size: int = 2048,
+) -> np.ndarray:
+    """
+    Per-hour anomaly score: mean squared reconstruction error at that hour
+    across every window covering it. Returns (N,). Requires N >= seq_len.
+    """
+    model.eval()
+    seq_len = model.decoder.seq_len
+    windows = torch.from_numpy(make_windows(values, seq_len))
+
+    errors = []
+    for i in range(0, len(windows), batch_size):
+        X = windows[i:i + batch_size].to(device)
+        errors.append(((model(X) - X) ** 2).squeeze(-1).cpu().numpy())
+    errors = np.concatenate(errors)                 # (W, seq_len)
+
+    total = np.zeros(len(values))
+    count = np.zeros(len(values))
+    for offset in range(seq_len):
+        total[offset:offset + len(errors)] += errors[:, offset]
+        count[offset:offset + len(errors)] += 1
+    return total / count
+
+
+# ─── THRESHOLD CALIBRATION ────────────────────────────────────────────────────
+
+def calibrate_threshold(
+    val_scores: np.ndarray,
+    val_labels: np.ndarray,
 ) -> Tuple[float, float, float]:
     """
-    Compute reconstruction error distribution on normal training windows.
-    Set threshold = mean + sigma_multiplier * std.
-
-    WHY use training data for calibration:
-      We want to know "how badly does the model reconstruct its own training
-      distribution?" Any test window with error well beyond that is anomalous.
-      Using val data here can also work but gives a slightly higher mean
-      (val windows weren't seen during training).
-
-    DataLoader contract: yields 4-tuples — unpack X_demand at index 1.
+    Pick the hourly-score threshold that maximises F1 on the validation split.
 
     Returns:
       threshold : float — anomaly decision boundary
-      mean_err  : float — mean reconstruction MSE on normal windows
-      std_err   : float — std of reconstruction MSE on normal windows
+      mean_err  : float — mean score on normal validation hours
+      std_err   : float — std of score on normal validation hours
     """
-    model.eval()
-    errors = []
+    precision, recall, cuts = precision_recall_curve(val_labels, val_scores)
+    f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-12)
+    best = int(np.argmax(f1[:-1]))   # last P/R point has no threshold
+    threshold = float(cuts[best])
 
-    for batch in normal_loader:
-        _, X_demand, _, _ = batch     # index 1 = demand-only signal
-        X_demand = X_demand.to(device)
-        recon    = model(X_demand)
+    normal   = val_scores[val_labels == 0]
+    mean_err = float(normal.mean())
+    std_err  = float(normal.std())
 
-        # Per-sample MSE across (seq_len, 1) dims → shape (batch,)
-        mse = ((recon - X_demand) ** 2).mean(dim=(1, 2))
-        errors.extend(mse.cpu().numpy().tolist())
-
-    errors    = np.array(errors)
-    mean_err  = float(errors.mean())
-    std_err   = float(errors.std())
-    threshold = mean_err + sigma_multiplier * std_err
-
-    print(f"  Anomaly threshold calibrated:")
-    print(f"    Mean reconstruction error : {mean_err:.6f}")
-    print(f"    Std  reconstruction error : {std_err:.6f}")
-    print(f"    Threshold ({sigma_multiplier}σ)           : {threshold:.6f}")
+    print(f"  Anomaly threshold calibrated on validation:")
+    print(f"    Mean score (normal hours) : {mean_err:.6f}")
+    print(f"    Std  score (normal hours) : {std_err:.6f}")
+    print(f"    Threshold (max val F1)    : {threshold:.6f}  "
+          f"(val P={precision[best]:.3f} R={recall[best]:.3f} F1={f1[best]:.3f})")
 
     return threshold, mean_err, std_err
 
 
 # ─── INFERENCE ────────────────────────────────────────────────────────────────
 
-@torch.no_grad()
 def detect_anomalies(
     model: LSTMAutoencoder,
-    X_demand: torch.Tensor,    # (batch, seq_len, 1) — demand-only, already on device
+    values: np.ndarray,       # (N,) scaled log demand
     threshold: float,
     device: str = "cpu",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Run anomaly detection on a batch of demand windows.
-
-    Called from evaluate_anomaly_detection() in train.py, which already
-    unpacks X_demand from the 4-tuple before passing it here.
-
-    Args:
-      X_demand  : (batch, seq_len, 1) — scaled demand signal
-      threshold : calibrated anomaly cutoff from calibrate_threshold()
+    Run hourly anomaly detection on a demand series.
 
     Returns:
-      errors     : (batch,) float — per-window reconstruction MSE
-      is_anomaly : (batch,) bool  — True where error > threshold
+      scores     : (N,) float — per-hour reconstruction score
+      is_anomaly : (N,) bool  — True where score > threshold
     """
-    model.eval()
-    X_demand = X_demand.to(device)
-    recon    = model(X_demand)
-
-    errors     = ((recon - X_demand) ** 2).mean(dim=(1, 2)).cpu().numpy()
-    is_anomaly = errors > threshold
-
-    return errors, is_anomaly
+    scores = score_series(model, values, device)
+    return scores, scores > threshold
