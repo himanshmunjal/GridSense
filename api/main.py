@@ -10,8 +10,11 @@ PURPOSE:
 
 HOW INFERENCE WORKS AT RUNTIME:
   1. At startup, load all 4 zone models + scalers into memory
-  2. Each request: grab the last 48 hours of "live" data (simulated from test set)
-  3. Run model inference → inverse transform → return JSON
+  2. Each request: grab the last 48 hours of "live" data (simulated from the
+     end of the zone CSV) + the next 24 hours of known covariates (calendar,
+     holidays, temperature — the archive's observed weather stands in for a
+     weather forecast here)
+  3. LSTM (MC Dropout) + LightGBM → validation-weighted blend → kWh → JSON
 
 WHY load models at startup (not per request):
   Loading a PyTorch model takes ~0.5s. At 30 requests/min that's 15s/min wasted.
@@ -21,6 +24,16 @@ RUN:
   uvicorn api.main:app --reload --port 8000
 """
 
+import os
+import sys
+# On macOS torch and LightGBM each bundle their own libomp. Two OpenMP
+# runtimes in one process segfault (in LightGBM fits or CPU LSTM passes)
+# unless OpenMP is single-threaded, and this must be set before either
+# library is imported. Training runs the networks on MPS, so it costs little.
+if sys.platform == "darwin":
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+import lightgbm as lgb
 import torch
 import numpy as np
 import json
@@ -33,29 +46,34 @@ from pydantic import BaseModel
 from typing import List
 from contextlib import asynccontextmanager
 
-import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from models.forecaster import DemandForecaster, predict_with_uncertainty
 from models.autoencoder import LSTMAutoencoder, detect_anomalies
+from models.gbm import predict_gbm
+from preprocess import (
+    build_features, load_weather, scale_demand, unscale_demand, to_model_space,
+    SCALE_COLS, FEATURE_COLS, FUTURE_COLS, LOOKBACK, HORIZON, ZONES,
+)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 SAVED_DIR    = Path("models/saved")
 DATA_DIR     = Path("data/zones")
-LOOKBACK     = 48
-HORIZON      = 24
 DEVICE       = "cpu"   # API server usually CPU; GPU stays for training
-ZONES        = [1, 2, 3, 4]
 
 # ─── STARTUP: LOAD EVERYTHING ─────────────────────────────────────────────────
 
 # These will be populated on startup
 forecasters   = {}
+boosters      = {}   # LightGBM forecasters
+lstm_weights  = {}   # LSTM share of the blended forecast
 autoencoders  = {}
 scalers       = {}
 thresholds    = {}
+interval_scales = {}  # calibrated band width (in MC stds) per horizon step
 zone_data     = {}   # in-memory "live" data buffer per zone
+weather       = None # hourly temperature, local time
 
 
 @asynccontextmanager
@@ -65,7 +83,6 @@ async def lifespan(app: FastAPI):
     Code before `yield` runs on startup, code after runs on shutdown.
     """
     # ── STARTUP ──────────────────────────────────────────────────────────────
-    print("Loading models...")
     _load_models()
     yield
     # ── SHUTDOWN (optional cleanup) ──────────────────────────────────────────
@@ -88,23 +105,36 @@ def _load_models():
     """
     Load all models, scalers, thresholds, and data into module-level dicts.
     """
+    global weather
     print("Loading models...")
+    weather = load_weather()
 
     with open(SAVED_DIR / "thresholds.json") as f:
         all_thresholds = json.load(f)
 
+    # Written by train.py — keeps architecture in sync with the saved weights
+    with open(SAVED_DIR / "model_config.json") as f:
+        config = json.load(f)
+    fc_cfg, ae_cfg = config["forecaster"], config["autoencoder"]
+
     for z in ZONES:
         # Forecaster
-        fc = DemandForecaster(input_size=10, hidden_size=128, num_layers=2,
-                               output_steps=HORIZON, dropout=0.2)
+        fc = DemandForecaster(input_size=fc_cfg["input_size"],
+                               future_size=fc_cfg["future_size"],
+                               hidden_size=fc_cfg["hidden_size"],
+                               num_layers=fc_cfg["num_layers"],
+                               output_steps=HORIZON, dropout=fc_cfg["dropout"])
         fc.load_state_dict(torch.load(SAVED_DIR / f"forecaster_zone_{z}.pt",
                                        map_location=DEVICE))
         fc.eval()
         forecasters[z] = fc
+        boosters[z] = lgb.Booster(model_file=str(SAVED_DIR / f"lgbm_zone_{z}.txt"))
+        lstm_weights[z] = config["lstm_weight"][f"zone_{z}"]
 
         # Autoencoder
         ae = LSTMAutoencoder(seq_len=LOOKBACK, input_size=1,
-                              hidden_size=64, latent_dim=32, num_layers=1)
+                              hidden_size=ae_cfg["hidden_size"],
+                              latent_dim=ae_cfg["latent_dim"], num_layers=1)
         ae.load_state_dict(torch.load(SAVED_DIR / f"autoencoder_zone_{z}.pt",
                                        map_location=DEVICE))
         ae.eval()
@@ -114,8 +144,9 @@ def _load_models():
         with open(Path("data/processed") / f"scaler_zone_{z}.pkl", "rb") as f:
             scalers[z] = pickle.load(f)
 
-        # Threshold
+        # Threshold + calibrated forecast band width
         thresholds[z] = all_thresholds[f"zone_{z}"]["threshold"]
+        interval_scales[z] = np.array(config["interval_scale"][f"zone_{z}"], dtype=np.float32)
 
         # Load zone data (we use this as our "live" data stream)
         df = pd.read_csv(DATA_DIR / f"zone_{z}.csv", parse_dates=["datetime"])
@@ -126,77 +157,28 @@ def _load_models():
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-# def get_latest_window(zone_id: int) -> np.ndarray:
-#     """
-#     Get the last 48 hours of normalized demand for a zone.
-#     In production this would query a real-time database.
-#     Here we take the last LOOKBACK rows of the test set.
-#     """
-#     df = zone_data[zone_id]
-#     scaler = scalers[zone_id]
-
-#     # Take last LOOKBACK + HORIZON rows from test portion (last 15%)
-#     n = len(df)
-#     test_start = int(n * 0.85)
-#     recent = df.iloc[-(LOOKBACK + HORIZON):-HORIZON]["demand_kwh"].values
-    
-#     if len(recent) < LOOKBACK:
-#         recent = df.iloc[-LOOKBACK:]["demand_kwh"].values
-
-#     normalized = scaler.transform(recent.reshape(-1, 1)).flatten()
-#     return normalized  # (LOOKBACK,)
-
 def get_latest_window(zone_id: int):
-    df = zone_data[zone_id].copy()
-    scaler = scalers[zone_id]
+    """
+    Scaled model inputs for a forecast issued at the last known hour:
+      X_past   : (LOOKBACK, INPUT_SIZE)  — last 48 hours of features
+      X_future : (HORIZON, FUTURE_SIZE)  — known covariates of the next 24 hours
+    In production this would query a real-time database and a weather
+    forecast; here we use the tail of the zone CSV. Features come from
+    preprocess.build_features so they always match what the models saw.
+    """
+    demand = zone_data[zone_id].set_index("datetime")["demand_kwh"]
+    # Append the 24 future hours with unknown demand: build_features still
+    # fills their calendar, holiday, lag-24/168 and temperature columns
+    future_idx = pd.date_range(demand.index[-1] + pd.Timedelta(hours=1),
+                               periods=HORIZON, freq="h")
+    demand = pd.concat([demand, pd.Series(np.nan, index=future_idx)])
 
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").set_index("datetime")
+    features = build_features(demand, weather).iloc[-(LOOKBACK + HORIZON):].copy()
+    features[SCALE_COLS] = scalers[zone_id].transform(features[SCALE_COLS])
+    X_past   = features[FEATURE_COLS].iloc[:LOOKBACK].values.astype(np.float32)
+    X_future = features[FUTURE_COLS].iloc[LOOKBACK:].values.astype(np.float32)
+    return X_past, X_future
 
-    df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
-
-    df["dow_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7)
-
-    df["demand_lag24"] = df["demand_kwh"].shift(24)
-    df["demand_lag168"] = df["demand_kwh"].shift(168)
-
-    df["rolling_mean_24"] = df["demand_kwh"].rolling(24).mean()
-    df["rolling_std_24"] = df["demand_kwh"].rolling(24).std()
-    df["rolling_mean_168"] = df["demand_kwh"].rolling(168).mean()
-
-    df = df.dropna()
-
-    SCALE_COLS = [
-        "demand_kwh",
-        "demand_lag24",
-        "demand_lag168",
-        "rolling_mean_24",
-        "rolling_std_24",
-        "rolling_mean_168",
-    ]
-
-    FEATURE_COLS = [
-        "demand_kwh",
-        "demand_lag24",
-        "demand_lag168",
-        "hour_sin",
-        "hour_cos",
-        "dow_sin",
-        "dow_cos",
-        "rolling_mean_24",
-        "rolling_std_24",
-        "rolling_mean_168",
-    ]
-
-    recent = df.iloc[-LOOKBACK:].copy()
-
-    recent[SCALE_COLS] = scaler.transform(
-        recent[SCALE_COLS]
-    )
-
-    return recent[FEATURE_COLS].values.astype(np.float32)
 
 # ─── RESPONSE MODELS ──────────────────────────────────────────────────────────
 
@@ -238,22 +220,29 @@ def get_forecast(zone: int = 1):
     scaler = scalers[zone]
     df     = zone_data[zone]
 
-    # Get input window
-    window = get_latest_window(zone)
-    X = torch.FloatTensor(window).unsqueeze(0)  # (1, 48, 1)
+    # Get input windows
+    X_past, X_future = get_latest_window(zone)
 
-    # MC Dropout inference
-    mean, lower, upper = predict_with_uncertainty(model, X, n_samples=50, device=DEVICE)
+    # MC Dropout inference — interval_scale=1 makes (mean − lower) the std
+    lstm_mean, lstm_lower, _ = predict_with_uncertainty(
+        model, torch.FloatTensor(X_past).unsqueeze(0),
+        torch.FloatTensor(X_future).unsqueeze(0),
+        n_samples=50, device=DEVICE, interval_scale=1.0,
+    )
+    lstm_mean = lstm_mean.squeeze().numpy()
+    std = lstm_mean - lstm_lower.squeeze().numpy()
 
-    # Inverse transform to kWh
-    demand_mean = scaler.mean_[0]
-    demand_std = scaler.scale_[0]
+    # Validation-weighted blend with LightGBM, validation-calibrated 95% bands
+    w = lstm_weights[zone]
+    gbm_mean = predict_gbm(boosters[zone], X_past[None], X_future[None])[0]
+    mean = w * lstm_mean + (1 - w) * gbm_mean
+    half = interval_scales[zone] * std
 
-    mean_kwh = mean.squeeze().numpy() * demand_std + demand_mean
-    lower_kwh = lower.squeeze().numpy() * demand_std + demand_mean
-    upper_kwh = upper.squeeze().numpy() * demand_std + demand_mean
-    # lower_kwh = scaler.inverse_transform(lower.squeeze().numpy().reshape(-1, 1)).flatten()
-    # upper_kwh = scaler.inverse_transform(upper.squeeze().numpy().reshape(-1, 1)).flatten()
+    # Inverse transform (scaled log space → kWh). Bands are asymmetric in
+    # kWh, which suits right-skewed demand.
+    mean_kwh  = unscale_demand(mean, scaler)
+    lower_kwh = unscale_demand(mean - half, scaler)
+    upper_kwh = unscale_demand(mean + half, scaler)
 
     # Generate future timestamps (next 24h from last known timestamp)
     last_ts = pd.to_datetime(df.iloc[-1]["datetime"])
@@ -278,69 +267,59 @@ def get_forecast(zone: int = 1):
 def get_anomalies(zone: int = 1, lookback_hours: int = 168):
     """
     Scan the last `lookback_hours` of data for anomalies.
-    Returns flagged events with severity classification.
+    Returns flagged hours with severity classification.
 
-    Severity based on how many σ above threshold:
-      < 1σ beyond threshold → low
-      1–2σ beyond threshold → medium
-      > 2σ beyond threshold → high
+    Severity based on how far the hourly score exceeds the threshold:
+      < 20% above threshold  → low
+      20–50% above threshold → medium
+      > 50% above threshold  → high
     """
     if zone not in ZONES:
         raise HTTPException(400, f"Zone must be one of {ZONES}")
+    if lookback_hours < 1:
+        raise HTTPException(400, "lookback_hours must be >= 1")
 
     model     = autoencoders[zone]
     scaler    = scalers[zone]
     threshold = thresholds[zone]
     df        = zone_data[zone]
 
-    # Get recent data
-    recent = df.iloc[-lookback_hours:].reset_index(drop=True)
-    # values = scaler.transform(recent["demand_kwh"].values.reshape(-1, 1)).flatten()
-    demand_mean = scaler.mean_[0]
-    demand_std = scaler.scale_[0]
+    # Score the requested hours plus LOOKBACK hours of extra context, so the
+    # earliest requested hours are covered by full windows too
+    context = df.iloc[-(lookback_hours + LOOKBACK):].reset_index(drop=True)
+    demand  = context["demand_kwh"].values
+    values  = scale_demand(to_model_space(demand), scaler).astype(np.float32)
+    scores, is_anomaly = detect_anomalies(model, values, threshold, DEVICE)
 
-    values = (
-        recent["demand_kwh"].values - demand_mean
-    ) / demand_std
+    # Typical level around each hour, to tell spikes from dropouts
+    local_median = pd.Series(demand).rolling(25, center=True, min_periods=1).median().values
 
     anomaly_events = []
+    for i in range(max(0, len(context) - lookback_hours), len(context)):
+        if not is_anomaly[i]:
+            continue
+        error  = float(scores[i])
+        excess = (error - threshold) / threshold
+        severity = "high" if excess > 0.5 else ("medium" if excess > 0.2 else "low")
 
-    # Slide a LOOKBACK window over recent data
-    for i in range(LOOKBACK, len(values)):
-        window = values[i - LOOKBACK:i]
-        X = torch.FloatTensor(window).unsqueeze(0).unsqueeze(-1)  # (1, 48, 1)
-        errors, is_anomaly = detect_anomalies(model, X, threshold, DEVICE)
-
-        if is_anomaly[0]:
-            error = float(errors[0])
-            demand = float(recent.iloc[i]["demand_kwh"])
-            ts = str(recent.iloc[i]["datetime"])
-
-            # Severity
-            excess = (error - threshold) / threshold
-            severity = "high" if excess > 0.5 else ("medium" if excess > 0.2 else "low")
-
-            # Try to use ground truth type if available, else infer
-            atype = recent.iloc[i].get("anomaly_type", "unknown")
-            if atype == "normal" or atype == "unknown":
-                atype = "spike" if demand > recent["demand_kwh"].mean() * 1.5 else "dropout"
-
-            anomaly_events.append(AnomalyEvent(
-                timestamp=ts,
-                demand_kwh=demand,
-                reconstruction_error=round(error, 6),
-                anomaly_type=atype,
-                severity=severity,
-            ))
+        anomaly_events.append(AnomalyEvent(
+            timestamp=str(context.iloc[i]["datetime"]),
+            demand_kwh=float(demand[i]),
+            reconstruction_error=round(error, 6),
+            anomaly_type="spike" if demand[i] > local_median[i] else "dropout",
+            severity=severity,
+        ))
 
     return AnomalyResponse(zone=zone, anomalies=anomaly_events, threshold=threshold)
 
 
 @app.get("/zones")
 def get_zones():
-    """Returns available zone metadata."""
-    zone_labels = {1: "Residential", 2: "Industrial", 3: "Commercial", 4: "Mixed"}
-    return [{"id": z, "label": zone_labels[z]} for z in ZONES]
+    """Returns available zone metadata (written by generate_zones.py)."""
+    with open(DATA_DIR / "zone_clients.json") as f:
+        meta = json.load(f)
+    return [{"id": z, "label": meta[f"zone_{z}"]["label"],
+             "n_clients": len(meta[f"zone_{z}"]["clients"])} for z in ZONES]
 
 
 @app.get("/health")
