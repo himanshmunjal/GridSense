@@ -2,13 +2,23 @@
 models/forecaster.py
 ────────────────────
 PURPOSE:
-  LSTM-based multi-step demand forecaster.
-  Predicts next 24 hours of demand given the last 48 hours + engineered features.
+  Encoder–decoder LSTM multi-step demand forecaster.
+  Predicts next 24 hours of demand given the last 48 hours of features plus
+  the known-future covariates of the next 24 hours (calendar, holidays,
+  same-hour-yesterday/last-week demand, temperature forecast).
 
 ARCHITECTURE:
-  Input (batch, 48, 10) → 2-layer LSTM → MCDropout → FC head → Output (batch, 24, 1)
+  X_past   (batch, 48, 15) → 2-layer encoder LSTM ─┐ (h, c)
+  X_future (batch, 24, 11) → 2-layer decoder LSTM ←┘
+                           → MCDropout → per-step MLP head → (batch, 24, 1)
 
 KEY DESIGN DECISIONS:
+
+  0. WHY encoder–decoder instead of "last hidden state → 24 outputs":
+     The old head had to guess the whole next day from one summary vector,
+     with no idea that tomorrow is a holiday or 8 °C colder. The decoder
+     walks through the 24 target hours with their own covariates, so each
+     step's prediction is conditioned on what is known about that hour.
 
   1. WHY LSTM over GRU:
      LSTM has a separate cell state that acts as long-term memory, useful for
@@ -31,16 +41,23 @@ KEY DESIGN DECISIONS:
      The LSTM's own inter-layer dropout (set via the dropout param) is handled
      separately: we call model.train() during MC inference to keep it active too.
 
-  4. WHY HuberLoss instead of MSE:
-     MSE squares errors, so a single spike anomaly in the training data
-     dominates the gradient and pulls weights toward predicting high values.
-     HuberLoss is quadratic for small errors and linear for large ones (delta=1.0),
-     making training robust to the 1% injected spike anomalies in the dataset.
+  4. WHY L1Loss in log space:
+     Inputs and targets are log1p(demand), standardised. Minimising L1 there
+     makes the model predict the conditional median, which is what MAE and
+     MAPE reward on right-skewed household load, and it is robust to any
+     spikes that remain in the inputs.
 
   5. WHY ReduceLROnPlateau scheduler:
      Fixed learning rates stall when loss plateaus. ReduceLROnPlateau halves
      the LR after `patience=3` epochs without val improvement, letting the
      model fine-tune into a sharper minimum without manual tuning.
+
+  6. WHY calibrate the MC Dropout intervals:
+     Raw MC Dropout spread (mean ± 1.96·std) is usually far too narrow — it
+     only captures model uncertainty, not the noise in the data. We measure
+     on the validation split how many stds the true value actually falls
+     from the mean, per horizon step, and use the 95th percentile of that
+     as the band width. The bands then really cover ~95% of outcomes.
 """
 
 import torch
@@ -68,20 +85,22 @@ class MCDropout(nn.Dropout):
 
 class DemandForecaster(nn.Module):
     """
-    2-layer LSTM with MC Dropout for 24-hour demand forecasting.
+    Encoder–decoder LSTM with MC Dropout for 24-hour demand forecasting.
 
     Args:
-      input_size   : number of input features per timestep (default 10)
+      input_size   : past features per timestep (default 15)
+      future_size  : known-future covariates per forecast step (default 11)
       hidden_size  : LSTM hidden units per layer (default 128)
-      num_layers   : number of stacked LSTM layers (default 2)
+      num_layers   : stacked LSTM layers in encoder and decoder (default 2)
       output_steps : forecast horizon in hours (default 24)
-      dropout      : dropout probability — applied both inside LSTM
-                     (inter-layer) and in MCDropout after LSTM output
+      dropout      : dropout probability — applied both inside the LSTMs
+                     (inter-layer) and in MCDropout on the decoder output
     """
 
     def __init__(
         self,
-        input_size: int  = 10,
+        input_size: int  = 15,
+        future_size: int = 11,
         hidden_size: int = 128,
         num_layers: int  = 2,
         output_steps: int = 24,
@@ -91,54 +110,38 @@ class DemandForecaster(nn.Module):
         self.hidden_size  = hidden_size
         self.num_layers   = num_layers
         self.output_steps = output_steps
+        lstm_dropout = dropout if num_layers > 1 else 0.0
 
-        # LSTM — batch_first=True so input is (batch, seq, features)
-        # dropout param activates inter-layer dropout (only when num_layers > 1)
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,   # ← uses constructor param, not hardcoded
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,  # ← uses constructor param
-        )
+        # batch_first=True so inputs are (batch, seq, features)
+        self.encoder = nn.LSTM(input_size, hidden_size, num_layers,
+                               batch_first=True, dropout=lstm_dropout)
+        # Decoder starts from the encoder's final (h, c) — the summary of
+        # the last 48h — and reads one future-covariate row per target hour
+        self.decoder = nn.LSTM(future_size, hidden_size, num_layers,
+                               batch_first=True, dropout=lstm_dropout)
 
-        # MCDropout on final LSTM output — stays active during eval()
+        # MCDropout on decoder outputs — stays active during eval()
         self.mc_dropout = MCDropout(p=dropout)
 
-        # Forecast head: hidden_size → output_steps
-        # Progressive narrowing gives the network capacity to learn
-        # non-linear combinations before the final projection.
-        # Using hidden_size (not hardcoded 128) so the class is reusable.
-        mid = hidden_size // 2   # 64 when hidden_size=128
+        # Per-step head shared across all 24 forecast hours
+        mid = hidden_size // 2
         self.fc = nn.Sequential(
             nn.Linear(hidden_size, mid),
             nn.GELU(),                    # GELU slightly outperforms ReLU on time-series
-            nn.Linear(mid, mid // 2),
-            nn.GELU(),
-            nn.Dropout(p=dropout),        # standard dropout (off at eval — intentional here)
-            nn.Linear(mid // 2, output_steps),
+            nn.Linear(mid, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_past: torch.Tensor, x_future: torch.Tensor) -> torch.Tensor:
         """
         Args:
-          x : (batch, lookback, input_size)
+          x_past   : (batch, lookback, input_size)
+          x_future : (batch, output_steps, future_size)
         Returns:
           forecast : (batch, output_steps, 1)
         """
-        # out: (batch, lookback, hidden_size)
-        # h_n: (num_layers, batch, hidden_size)
-        out, _ = self.lstm(x)
-
-        # Take only the final timestep's hidden state as the sequence summary
-        last_hidden = out[:, -1, :]           # (batch, hidden_size)
-
-        # MC Dropout — active even during eval() for uncertainty estimation
-        last_hidden = self.mc_dropout(last_hidden)
-
-        # Project to forecast horizon
-        forecast = self.fc(last_hidden)       # (batch, output_steps)
-        return forecast.unsqueeze(-1)         # (batch, output_steps, 1)
+        _, state = self.encoder(x_past)          # (h, c): (num_layers, batch, hidden)
+        dec_out, _ = self.decoder(x_future, state)  # (batch, output_steps, hidden)
+        return self.fc(self.mc_dropout(dec_out))    # (batch, output_steps, 1)
 
 
 # ─── TRAINING ─────────────────────────────────────────────────────────────────
@@ -151,13 +154,13 @@ def train_forecaster(
     lr: float     = 1e-3,
     device: str   = "cpu",
     patience: int = 7,
+    weight_decay: float = 0.0,
 ) -> Tuple[DemandForecaster, dict]:
     """
     Train the forecaster with early stopping + LR scheduling.
 
     The DataLoader from preprocess.py yields 4-tuples:
-      (X_full, X_demand, y, anomaly)
-    The forecaster uses X_full (all features) and y.
+      (X_past, X_future, y, anomaly)
 
     Early stopping: restore best weights if val loss stagnates for
     `patience` epochs — prevents overfitting on small zone datasets.
@@ -167,10 +170,11 @@ def train_forecaster(
       history : dict with "train_loss" and "val_loss" lists
     """
     model     = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # AdamW: decoupled weight decay regularises without fighting Adam's scaling
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # HuberLoss: robust to spike anomalies in the training targets
-    criterion = nn.HuberLoss(delta=1.0)
+    # L1 in log space → conditional median forecast (see header note 4)
+    criterion = nn.L1Loss()
 
     # Halve LR after 3 epochs without val improvement
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -188,11 +192,11 @@ def train_forecaster(
         model.train()
         train_losses = []
         for batch in train_loader:
-            X_full, _, y, _ = batch          # forecaster only needs X_full and y
-            X_full, y = X_full.to(device), y.to(device)
+            X_past, X_future, y, _ = batch
+            X_past, X_future, y = X_past.to(device), X_future.to(device), y.to(device)
 
             optimizer.zero_grad()
-            pred = model(X_full)             # (batch, horizon, 1)
+            pred = model(X_past, X_future)   # (batch, horizon, 1)
             loss = criterion(pred, y)
             loss.backward()
 
@@ -207,9 +211,9 @@ def train_forecaster(
         val_losses = []
         with torch.no_grad():
             for batch in val_loader:
-                X_full, _, y, _ = batch
-                X_full, y = X_full.to(device), y.to(device)
-                pred = model(X_full)
+                X_past, X_future, y, _ = batch
+                pred = model(X_past.to(device), X_future.to(device))
+                y = y.to(device)
                 val_losses.append(criterion(pred, y).item())
 
         train_loss = np.mean(train_losses)
@@ -245,9 +249,11 @@ def train_forecaster(
 @torch.no_grad()
 def predict_with_uncertainty(
     model: DemandForecaster,
-    X: torch.Tensor,
+    X_past: torch.Tensor,
+    X_future: torch.Tensor,
     n_samples: int = 50,
     device: str    = "cpu",
+    interval_scale = 1.96,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Monte Carlo Dropout inference for calibrated uncertainty intervals.
@@ -266,24 +272,69 @@ def predict_with_uncertainty(
 
     Args:
       model    : trained DemandForecaster
-      X        : (batch, lookback, input_size) — X_full from DataLoader
+      X_past   : (batch, lookback, input_size)
+      X_future : (batch, horizon, future_size)
       n_samples: number of MC forward passes
       device   : "cpu" or "cuda"
+      interval_scale : band half-width in stds — 1.96, or the per-step
+                       (horizon,) array from calibrate_intervals()
 
     Returns:
       mean  : (batch, horizon, 1) — point forecast
-      lower : (batch, horizon, 1) — 95% CI lower bound (mean - 1.96*std)
-      upper : (batch, horizon, 1) — 95% CI upper bound (mean + 1.96*std)
+      lower : (batch, horizon, 1) — 95% CI lower bound (mean - scale*std)
+      upper : (batch, horizon, 1) — 95% CI upper bound (mean + scale*std)
     """
     model.train()   # activate all dropout layers for stochastic inference
-    X = X.to(device)
+    X_past, X_future = X_past.to(device), X_future.to(device)
 
     # Stack n_samples predictions: (n_samples, batch, horizon, 1)
-    samples = torch.stack([model(X) for _ in range(n_samples)], dim=0)
+    samples = torch.stack([model(X_past, X_future) for _ in range(n_samples)], dim=0)
 
     mean  = samples.mean(dim=0)
     std   = samples.std(dim=0)
-    lower = mean - 1.96 * std
-    upper = mean + 1.96 * std
+    scale = torch.as_tensor(interval_scale, dtype=mean.dtype, device=mean.device)
+    if scale.ndim == 1:
+        scale = scale.view(1, -1, 1)   # per horizon step
+    lower = mean - scale * std
+    upper = mean + scale * std
 
+    model.eval()
     return mean.cpu(), lower.cpu(), upper.cpu()
+
+
+def predict_loader(
+    model: DemandForecaster,
+    loader,
+    n_samples: int = 30,
+    device: str    = "cpu",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    MC Dropout forecasts for a whole DataLoader.
+
+    Returns (y_true, mean, std), each (N, horizon) in scaled log space.
+    """
+    trues, means, stds = [], [], []
+    with torch.no_grad():
+        for X_past, X_future, y, _ in loader:
+            model.train()
+            X_past, X_future = X_past.to(device), X_future.to(device)
+            samples = torch.stack([model(X_past, X_future) for _ in range(n_samples)])
+            trues.append(y.squeeze(-1).numpy())
+            means.append(samples.mean(0).squeeze(-1).cpu().numpy())
+            stds.append(samples.std(0).squeeze(-1).cpu().numpy())
+    model.eval()
+    return np.concatenate(trues), np.concatenate(means), np.concatenate(stds)
+
+
+def calibrate_intervals(
+    y_true: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+    coverage: float = 0.95,
+) -> np.ndarray:
+    """
+    Per-horizon-step band width (in MC stds) that achieves `coverage` on the
+    given (validation) forecasts. Returns (horizon,).
+    """
+    z = np.abs(y_true - mean) / np.maximum(std, 1e-6)
+    return np.quantile(z, coverage, axis=0)
