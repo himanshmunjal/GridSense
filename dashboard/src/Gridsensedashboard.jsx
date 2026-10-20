@@ -7,12 +7,15 @@ import {
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const API_BASE = "http://localhost:8000";
 const ZONES = [
-  { id: 1, label: "Residential", color: "#00d4ff" },
-  { id: 2, label: "Industrial",  color: "#ff6b35" },
-  { id: 3, label: "Commercial",  color: "#39ff14" },
-  { id: 4, label: "Mixed",       color: "#bf5fff" },
+  { id: 1, label: "Evening-peak",     color: "#00d4ff" },
+  { id: 2, label: "Baseload 24/7",    color: "#ff6b35" },
+  { id: 3, label: "Weekday-business", color: "#39ff14" },
+  { id: 4, label: "Mixed",            color: "#bf5fff" },
 ];
 const POLL_INTERVAL = 30000; // 30s
+
+// Zone loads are tens of thousands of kWh per hour — display in MWh
+const toMWh = (kwh) => parseFloat((kwh / 1000).toFixed(2));
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 const fmtTime = (iso) => {
@@ -150,14 +153,14 @@ export default function GridSenseDashboard() {
   const chartData = forecast ? [
     ...forecast.actual_history.map((v, i) => ({
       time: fmtTime(forecast.history_timestamps[i]),
-      actual: parseFloat(v.toFixed(2)),
+      actual: toMWh(v),
       type: "history",
     })),
     ...forecast.forecast.map((v, i) => ({
       time: fmtTime(forecast.timestamps[i]),
-      forecast: parseFloat(v.toFixed(2)),
-      lower: parseFloat(forecast.lower_bound[i].toFixed(2)),
-      upper: parseFloat(forecast.upper_bound[i].toFixed(2)),
+      forecast: toMWh(v),
+      lower: toMWh(forecast.lower_bound[i]),
+      upper: toMWh(forecast.upper_bound[i]),
       type: "forecast",
     })),
   ] : [];
@@ -235,8 +238,8 @@ export default function GridSenseDashboard() {
         {[
           { label: "ANOMALIES DETECTED", value: anomalies.length, unit: "events", color: anomalies.length > 0 ? "#ff3b3b" : "#39ff14" },
           { label: "HIGH SEVERITY", value: anomalies.filter(a => a.severity === "high").length, unit: "critical", color: "#ff3b3b" },
-          { label: "AVG FORECAST", value: forecast ? Math.round(forecast.forecast.reduce((a,b)=>a+b,0)/forecast.forecast.length) : "—", unit: "kWh/hr", color: zoneColor },
-          { label: "PEAK FORECAST", value: forecast ? Math.round(Math.max(...forecast.forecast)) : "—", unit: "kWh/hr", color: "#ffd60a" },
+          { label: "AVG FORECAST", value: forecast ? toMWh(forecast.forecast.reduce((a,b)=>a+b,0)/forecast.forecast.length).toFixed(1) : "—", unit: "MWh/hr", color: zoneColor },
+          { label: "PEAK FORECAST", value: forecast ? toMWh(Math.max(...forecast.forecast)).toFixed(1) : "—", unit: "MWh/hr", color: "#ffd60a" },
         ].map((card, i) => (
           <div key={i} style={{
             background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
@@ -295,7 +298,7 @@ export default function GridSenseDashboard() {
               <XAxis dataKey="time" tick={{ fontSize: 10, fill: "#555" }} tickLine={false} axisLine={false}
                 interval={5} />
               <YAxis tick={{ fontSize: 10, fill: "#555" }} tickLine={false} axisLine={false}
-                tickFormatter={v => `${v}kWh`} width={60} />
+                tickFormatter={v => `${v} MWh`} width={60} />
               <Tooltip
                 contentStyle={{ background: "#13161f", border: "1px solid rgba(255,255,255,0.1)",
                   borderRadius: 6, fontSize: 11, color: "#ccc" }}
@@ -326,7 +329,7 @@ export default function GridSenseDashboard() {
             ANOMALY ALERT PANEL
           </div>
           <div style={{ fontSize: 10, color: "#555", marginBottom: 16 }}>
-            Events deviating &gt;2σ from expected reconstruction
+            Hours whose reconstruction error exceeds the validation-tuned threshold
           </div>
 
           {anomalies.length === 0 ? (
@@ -341,7 +344,7 @@ export default function GridSenseDashboard() {
                   <div>
                     <div style={{ fontSize: 11, color: "#ccc" }}>{fmtDateTime(a.timestamp)}</div>
                     <div style={{ fontSize: 10, color: "#555", marginTop: 2 }}>
-                      {a.demand_kwh.toFixed(1)} kWh · {a.anomaly_type}
+                      {toMWh(a.demand_kwh).toFixed(2)} MWh · {a.anomaly_type}
                     </div>
                   </div>
                   <div style={{ fontSize: 10, color: "#666", textAlign: "right" }}>
