@@ -1,22 +1,282 @@
 {
   "zone_1": {
-    "MAE": 26.5154,
-    "RMSE": 38.1223,
-    "MAPE": 63.3766
+    "MAE": 1159.6332,
+    "RMSE": 2770.9039,
+    "MAPE": 3.392,
+    "WAPE": 3.1675,
+    "lstm_weight": 0.45,
+    "normal_hours": {
+      "MAE": 1010.3792,
+      "RMSE": 1812.2777,
+      "MAPE": 2.826,
+      "WAPE": 2.7635
+    },
+    "models": {
+      "naive_lag24": {
+        "MAE": 1576.96,
+        "RMSE": 3951.5479,
+        "MAPE": 4.672,
+        "WAPE": 4.3074
+      },
+      "naive_lag168": {
+        "MAE": 1963.4521,
+        "RMSE": 4078.2709,
+        "MAPE": 5.4586,
+        "WAPE": 5.363
+      },
+      "lstm": {
+        "MAE": 1237.162,
+        "RMSE": 2820.5157,
+        "MAPE": 3.5402,
+        "WAPE": 3.3792
+      },
+      "lightgbm": {
+        "MAE": 1238.0456,
+        "RMSE": 2904.2295,
+        "MAPE": 3.6699,
+        "WAPE": 3.3816
+      },
+      "ensemble": {
+        "MAE": 1159.6332,
+        "RMSE": 2770.9039,
+        "MAPE": 3.392,
+        "WAPE": 3.1675
+      }
+    },
+    "naive_lag24": {
+      "MAE": 1576.96,
+      "RMSE": 3951.5479,
+      "MAPE": 4.672,
+      "WAPE": 4.3074
+    },
+    "skill_vs_naive_MAE": 0.2646,
+    "skill_vs_weekly_naive_MAE": 0.4094,
+    "interval_coverage_95": 0.9636,
+    "ablations": {
+      "no_weather": {
+        "MAE": 1309.4183,
+        "RMSE": 3034.8775,
+        "MAPE": 3.816,
+        "WAPE": 3.5766,
+        "MAPE_increase": 0.1461
+      },
+      "no_holiday": {
+        "MAE": 1268.732,
+        "RMSE": 3009.7819,
+        "MAPE": 3.786,
+        "WAPE": 3.4655,
+        "MAPE_increase": 0.1161
+      }
+    }
   },
   "zone_2": {
-    "MAE": 36.8614,
-    "RMSE": 53.7858,
-    "MAPE": 68.1434
+    "MAE": 339.6236,
+    "RMSE": 940.8276,
+    "MAPE": 4.4,
+    "WAPE": 3.4606,
+    "lstm_weight": 0.15000000000000002,
+    "normal_hours": {
+      "MAE": 257.7863,
+      "RMSE": 409.8855,
+      "MAPE": 2.6247,
+      "WAPE": 2.6242
+    },
+    "models": {
+      "naive_lag24": {
+        "MAE": 490.0576,
+        "RMSE": 1250.6109,
+        "MAPE": 5.9137,
+        "WAPE": 4.9934
+      },
+      "naive_lag168": {
+        "MAE": 510.7546,
+        "RMSE": 1317.9808,
+        "MAPE": 6.1301,
+        "WAPE": 5.2043
+      },
+      "lstm": {
+        "MAE": 383.1835,
+        "RMSE": 1025.1639,
+        "MAPE": 4.8037,
+        "WAPE": 3.9044
+      },
+      "lightgbm": {
+        "MAE": 341.6933,
+        "RMSE": 936.4282,
+        "MAPE": 4.4317,
+        "WAPE": 3.4816
+      },
+      "ensemble": {
+        "MAE": 339.6236,
+        "RMSE": 940.8276,
+        "MAPE": 4.4,
+        "WAPE": 3.4606
+      }
+    },
+    "naive_lag24": {
+      "MAE": 490.0576,
+      "RMSE": 1250.6109,
+      "MAPE": 5.9137,
+      "WAPE": 4.9934
+    },
+    "skill_vs_naive_MAE": 0.307,
+    "skill_vs_weekly_naive_MAE": 0.3351,
+    "interval_coverage_95": 0.9594,
+    "ablations": {
+      "no_weather": {
+        "MAE": 348.9425,
+        "RMSE": 941.3336,
+        "MAPE": 4.5045,
+        "WAPE": 3.5555,
+        "MAPE_increase": 0.0728
+      },
+      "no_holiday": {
+        "MAE": 347.5184,
+        "RMSE": 937.6032,
+        "MAPE": 4.4854,
+        "WAPE": 3.541,
+        "MAPE_increase": 0.0537
+      }
+    }
   },
   "zone_3": {
-    "MAE": 21.9858,
-    "RMSE": 32.0488,
-    "MAPE": 64.5734
+    "MAE": 539.9788,
+    "RMSE": 1186.1062,
+    "MAPE": 3.5647,
+    "WAPE": 3.3424,
+    "lstm_weight": 0.2,
+    "normal_hours": {
+      "MAE": 474.572,
+      "RMSE": 694.9578,
+      "MAPE": 2.9793,
+      "WAPE": 2.9374
+    },
+    "models": {
+      "naive_lag24": {
+        "MAE": 1623.4898,
+        "RMSE": 2642.5173,
+        "MAPE": 10.4936,
+        "WAPE": 10.0493
+      },
+      "naive_lag168": {
+        "MAE": 774.8059,
+        "RMSE": 1717.2756,
+        "MAPE": 5.1438,
+        "WAPE": 4.796
+      },
+      "lstm": {
+        "MAE": 608.674,
+        "RMSE": 1297.5828,
+        "MAPE": 4.0157,
+        "WAPE": 3.7676
+      },
+      "lightgbm": {
+        "MAE": 557.9638,
+        "RMSE": 1196.7781,
+        "MAPE": 3.676,
+        "WAPE": 3.4537
+      },
+      "ensemble": {
+        "MAE": 539.9788,
+        "RMSE": 1186.1062,
+        "MAPE": 3.5647,
+        "WAPE": 3.3424
+      }
+    },
+    "naive_lag24": {
+      "MAE": 1623.4898,
+      "RMSE": 2642.5173,
+      "MAPE": 10.4936,
+      "WAPE": 10.0493
+    },
+    "skill_vs_naive_MAE": 0.6674,
+    "skill_vs_weekly_naive_MAE": 0.3031,
+    "interval_coverage_95": 0.9666,
+    "ablations": {
+      "no_weather": {
+        "MAE": 567.0947,
+        "RMSE": 1210.7905,
+        "MAPE": 3.7305,
+        "WAPE": 3.5103,
+        "MAPE_increase": 0.0545
+      },
+      "no_holiday": {
+        "MAE": 594.8496,
+        "RMSE": 1244.7576,
+        "MAPE": 3.9173,
+        "WAPE": 3.6821,
+        "MAPE_increase": 0.2413
+      }
+    }
   },
   "zone_4": {
-    "MAE": 29.7011,
-    "RMSE": 42.4422,
-    "MAPE": 71.0944
+    "MAE": 1818.902,
+    "RMSE": 5106.176,
+    "MAPE": 4.101,
+    "WAPE": 2.9999,
+    "lstm_weight": 0.5,
+    "normal_hours": {
+      "MAE": 1488.1527,
+      "RMSE": 3148.4407,
+      "MAPE": 2.6981,
+      "WAPE": 2.4404
+    },
+    "models": {
+      "naive_lag24": {
+        "MAE": 2315.7277,
+        "RMSE": 6624.5185,
+        "MAPE": 5.0856,
+        "WAPE": 3.8193
+      },
+      "naive_lag168": {
+        "MAE": 3239.7552,
+        "RMSE": 6872.795,
+        "MAPE": 6.582,
+        "WAPE": 5.3432
+      },
+      "lstm": {
+        "MAE": 2009.5067,
+        "RMSE": 5649.2771,
+        "MAPE": 4.4362,
+        "WAPE": 3.3142
+      },
+      "lightgbm": {
+        "MAE": 1863.6151,
+        "RMSE": 4947.0238,
+        "MAPE": 4.2205,
+        "WAPE": 3.0736
+      },
+      "ensemble": {
+        "MAE": 1818.902,
+        "RMSE": 5106.176,
+        "MAPE": 4.101,
+        "WAPE": 2.9999
+      }
+    },
+    "naive_lag24": {
+      "MAE": 2315.7277,
+      "RMSE": 6624.5185,
+      "MAPE": 5.0856,
+      "WAPE": 3.8193
+    },
+    "skill_vs_naive_MAE": 0.2145,
+    "skill_vs_weekly_naive_MAE": 0.4386,
+    "interval_coverage_95": 0.9456,
+    "ablations": {
+      "no_weather": {
+        "MAE": 1992.5562,
+        "RMSE": 5092.8138,
+        "MAPE": 4.3846,
+        "WAPE": 3.2863,
+        "MAPE_increase": 0.1641
+      },
+      "no_holiday": {
+        "MAE": 1948.7828,
+        "RMSE": 5212.8888,
+        "MAPE": 4.3767,
+        "WAPE": 3.2141,
+        "MAPE_increase": 0.1562
+      }
+    }
   }
 }
