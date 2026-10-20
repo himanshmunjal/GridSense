@@ -2,154 +2,203 @@
 generate_zones.py
 ─────────────────
 PURPOSE:
-  Load UCI household power dataset → resample to hourly →
-  replicate into 4 synthetic zones with realistic variation.
+  Build 4 grid zones from REAL metered load: the UCI ElectricityLoadDiagrams
+  2011–2014 dataset (370 Portuguese clients, 15-minute readings).
+    → keep clients metered for the whole 2012–2014 period
+    → group clients by the SHAPE of their average weekly load profile
+    → each zone = the summed hourly load of one group
+    → inject labelled multi-hour anomalies for evaluation
 
-WHY THIS APPROACH:
-  The UCI dataset is a single household. Real grids have multiple zones
-  (industrial, residential, commercial, mixed). We simulate this by:
-    - Zone 1 (Residential)  : base signal, evening peak
-    - Zone 2 (Industrial)   : morning + afternoon peak, lower night
-    - Zone 3 (Commercial)   : flat daytime, sharp drop at night
-    - Zone 4 (Mixed)        : blend of all three + most noise
+WHY GROUP BY LOAD SHAPE INSTEAD OF RANDOMLY:
+  Real distribution zones differ in shape, not just size. From each
+  client's normalised 168-hour weekly profile we measure three descriptors
+  and fill three zones of ZONE_SIZE clients greedily:
+    Zone 3 Weekday-business : lowest weekend/weekday ratio
+    Zone 2 Baseload 24/7    : highest night/average ratio (of the rest)
+    Zone 1 Evening-peak     : highest evening/daytime ratio (of the rest)
+    Zone 4 Mixed            : everyone left
+  Plain KMeans on the profiles was tried first: it put the single
+  weekday-only outlier client in its own cluster, which is not a zone.
+  The dataset does not say which clients are homes or businesses, so the
+  zones are named by measured shape rather than by customer type.
+  Only the first TRAIN_FRAC of the period is used to define zones, so they
+  never see the test period.
 
-  Each zone gets a different scale factor, phase shift, and noise level.
-  This teaches you how domain adaptation works: same underlying signal,
-  different real-world characteristics.
+WHY DROP CLIENTS ABOVE MAX_CLIENT_KWH:
+  Three meters average 11–50 MWh/h — more than whole groups of ordinary
+  clients combined; they look like substation-level feeds. Any zone holding
+  one would effectively be a single meter.
+
+DATA NOTES (from the UCI dataset description):
+  - Values are kW averaged over each 15 minutes → kWh per 15 min = kW / 4.
+  - Timestamps are Portuguese local time and label the END of each interval.
+  - On the March DST day the 01:00–02:00 hour is all zeros; on the October
+    DST day it holds two hours of consumption. Both are repaired below.
+
+DOWNLOAD:
+  https://archive.ics.uci.edu/dataset/321/electricityloaddiagrams20112014
+  → unzip LD2011_2014.txt into data/raw/
 
 OUTPUT:
-  data/zones/zone_{1..4}.csv  — hourly demand per zone
+  data/zones/zone_{1..4}.csv  — hourly demand per zone (kWh), pre-injection
+                                demand, anomaly labels
   data/zones/combined.csv     — all zones merged
+  data/zones/zone_clients.json — which clients make up each zone
 """
 
-import pandas as pd
+import json
 import numpy as np
+import pandas as pd
 from pathlib import Path
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-RAW_DATA_PATH = "household_power_consumption.txt"  # UCI dataset path
+RAW_DATA_PATH = Path("data/raw/LD2011_2014.txt")
 OUTPUT_DIR    = Path("data/zones")
 RANDOM_SEED   = 42
 
-# Zone characteristics: (scale, phase_shift_hours, noise_std, label)
-ZONE_CONFIG = {
-    1: dict(scale=1.00, phase=0,  noise=0.05, label="Residential"),
-    2: dict(scale=1.35, phase=-2, noise=0.08, label="Industrial"),
-    3: dict(scale=0.80, phase=1,  noise=0.04, label="Commercial"),
-    4: dict(scale=1.10, phase=0,  noise=0.12, label="Mixed"),
-}
+START, END    = "2012-01-01 00:00", "2014-12-31 23:00"   # hourly labels kept
+TRAIN_FRAC    = 0.70     # must match preprocess.py — clustering uses train only
+ZONE_SIZE     = 60       # clients in each shape-defined zone (zone 4 gets the rest)
+MAX_CLIENT_KWH = 10_000  # mean kWh/h above which a meter is treated as a feeder
+ANOMALY_RATE  = 0.01     # share of hours inside an anomaly event
+
+ZONE_LABELS = {1: "Evening-peak", 2: "Baseload 24/7", 3: "Weekday-business", 4: "Mixed"}
 
 # ─── LOAD & CLEAN ─────────────────────────────────────────────────────────────
 
-def load_uci_dataset(path: str) -> pd.DataFrame:
-    """
-    UCI dataset is semicolon-separated with a Date + Time column.
-    Missing values are marked as '?'  — we interpolate them.
-    
-    WHY interpolate vs drop:
-      Dropping creates irregular time series — LSTMs need uniform intervals.
-      Linear interpolation is safe here since gaps are short (< 1hr usually).
-    """
-    print("Loading UCI dataset...")
-    df = pd.read_csv(
-        path,
-        sep=";",
-        parse_dates={"datetime": ["Date", "Time"]},
-        dayfirst=True,
-        low_memory=False,
-        na_values=["?"],
-    )
-    df = df.sort_values("datetime").set_index("datetime")
+def load_hourly_clients(path: Path) -> pd.DataFrame:
+    """15-minute kW readings → hourly kWh per client, 2012–2014."""
+    print("Loading UCI ElectricityLoadDiagrams...")
+    df = pd.read_csv(path, sep=";", decimal=",", index_col=0, parse_dates=True)
+    df = df.astype(np.float32) / 4.0       # kW over 15 min → kWh
 
-    # We only need Global_active_power (kW) as our demand signal
-    demand = df["Global_active_power"].astype(float)
-
-    # Interpolate missing values linearly
-    n_missing = demand.isna().sum()
-    print(f"  → Interpolating {n_missing} missing values ({n_missing/len(demand)*100:.1f}%)")
-    demand = demand.interpolate(method="linear").ffill().bfill()
-
-    # Resample from 1-minute to hourly by summing (kWh per hour)
-    # WHY sum not mean: power (kW) × time (1/60 hr) = energy (kWh)
-    # Summing 60 one-minute readings gives total energy for that hour
-    hourly = demand.resample("h").sum()
-    print(f"  → Resampled to {len(hourly)} hourly records "
+    # Readings label the END of each 15-min interval: 00:15…01:00 → hour 00:00
+    hourly = df.resample("h", closed="right", label="left").sum()
+    hourly = hourly.loc[START:END]
+    print(f"  → {hourly.shape[1]} clients, {len(hourly)} hours "
           f"({hourly.index[0]} → {hourly.index[-1]})")
     return hourly
 
 
-# ─── ZONE REPLICATION ─────────────────────────────────────────────────────────
-
-def add_zone_profile(series: pd.Series, zone_id: int, rng: np.random.Generator) -> pd.Series:
+def select_active_clients(hourly: pd.DataFrame) -> pd.DataFrame:
     """
-    Transforms the base hourly demand into a zone-specific profile.
-
-    Three transformations:
-    1. PHASE SHIFT  — different zones peak at different hours of day
-                      (industrial peaks 2h earlier than residential)
-    2. SCALE        — zones have different absolute demand magnitudes
-    3. NOISE        — realistic measurement + behavioral variation
-
-    WHY additive noise over multiplicative:
-      Multiplicative noise creates unrealistically large swings during peaks.
-      Additive Gaussian noise better models sensor jitter + small behavioral variance.
+    Keep clients that are metered throughout (≤1% zero hours, live at both
+    ends) and are not feeder-sized (see header).
     """
-    cfg = ZONE_CONFIG[zone_id]
+    zero_share = (hourly <= 0).mean()
+    live_start = (hourly.iloc[:24 * 7] > 0).mean() > 0.5
+    live_end   = (hourly.iloc[-24 * 7:] > 0).mean() > 0.5
+    active = (zero_share <= 0.01) & live_start & live_end
+    feeder = hourly.iloc[: int(len(hourly) * TRAIN_FRAC)].mean() > MAX_CLIENT_KWH
+    keep = active & ~feeder
+    print(f"  → {active.sum()} clients active for the whole period, "
+          f"{(active & feeder).sum()} feeder-sized dropped → {keep.sum()} kept")
+    return hourly.loc[:, keep]
 
-    # Phase shift: roll time series by N hours
-    shifted = series.copy()
-    if cfg["phase"] != 0:
-        shifted = pd.Series(
-            np.roll(shifted.values, cfg["phase"]),
-            index=shifted.index
+
+def fix_dst(zone: pd.Series) -> pd.Series:
+    """Repair the DST artefacts described in the header."""
+    zone = zone.copy()
+    for year in sorted(set(zone.index.year)):
+        last_sun = lambda month: max(
+            d for d in pd.date_range(f"{year}-{month}-01", periods=31, freq="D")
+            if d.month == month and d.dayofweek == 6
         )
-
-    # Scale the zone
-    scaled = shifted * cfg["scale"]
-
-    # Add Gaussian noise (proportional to mean to keep SNR consistent)
-    noise = rng.normal(0, cfg["noise"] * scaled.mean(), size=len(scaled))
-    noisy = (scaled + noise).clip(lower=0)  # demand can't be negative
-
-    noisy.name = f"zone_{zone_id}"
-    return noisy
+        march = last_sun(3) + pd.Timedelta(hours=1)
+        october = last_sun(10) + pd.Timedelta(hours=1)
+        if march in zone.index:
+            zone[march] = np.nan               # missing hour → interpolate
+        if october in zone.index:
+            zone[october] /= 2                 # two hours summed → one hour
+    return zone.interpolate()
 
 
-def inject_anomalies(series: pd.Series, rng: np.random.Generator, anomaly_rate: float = 0.01):
+# ─── ZONES BY LOAD-SHAPE CLUSTERING ───────────────────────────────────────────
+
+def weekly_profiles(hourly: pd.DataFrame) -> pd.DataFrame:
+    """Mean load per (day-of-week, hour), each client normalised by its own mean."""
+    idx = hourly.index
+    prof = hourly.groupby([idx.dayofweek, idx.hour]).mean()     # (168, clients)
+    return (prof / prof.mean()).T                               # (clients, 168)
+
+
+def profile_stats(profile: np.ndarray) -> dict:
+    """Shape descriptors of a normalised 168-h profile (Mon 00h … Sun 23h)."""
+    p = profile.reshape(7, 24)
+    weekday, weekend = p[:5].mean(), p[5:].mean()
+    return {
+        "weekend_ratio": weekend / weekday,                          # <1: shuts on weekends
+        "night_ratio":   p[:, 0:6].mean() / p.mean(),                # ~1: runs 24/7
+        "evening_ratio": p[:, 18:23].mean() / p[:, 9:17].mean(),     # >1: residential
+    }
+
+
+def assign_zones(hourly: pd.DataFrame) -> dict:
+    """Train-period weekly profiles → {zone_id: [client names]} (see header)."""
+    train = hourly.iloc[: int(len(hourly) * TRAIN_FRAC)]
+    profiles = weekly_profiles(train)
+    stats = pd.DataFrame([profile_stats(profiles.loc[c].values) for c in profiles.index],
+                         index=profiles.index)
+
+    zones, rest = {}, stats
+    for zone_id, key, ascending in [(3, "weekend_ratio", True),
+                                    (2, "night_ratio", False),
+                                    (1, "evening_ratio", False)]:
+        members = rest.sort_values(key, ascending=ascending).index[:ZONE_SIZE]
+        zones[zone_id] = list(members)
+        rest = rest.drop(members)
+    zones[4] = list(rest.index)
+
+    for zone_id in sorted(zones):
+        load = train[zones[zone_id]]
+        s = profile_stats(weekly_profiles(load.sum(axis=1).to_frame()).values[0])
+        biggest = load.mean().max() / load.mean().sum()
+        print(f"  Zone {zone_id} ({ZONE_LABELS[zone_id]:16s}): {len(zones[zone_id]):3d} clients | "
+              f"weekend/weekday {s['weekend_ratio']:.2f} | night {s['night_ratio']:.2f} | "
+              f"evening/day {s['evening_ratio']:.2f} | largest client {biggest:.0%}")
+    return dict(sorted(zones.items()))
+
+
+# ─── ANOMALY INJECTION ────────────────────────────────────────────────────────
+
+def inject_anomalies(series: pd.Series, rng: np.random.Generator, anomaly_rate: float):
     """
-    Injects labeled anomalies for evaluation purposes.
-    
+    Inject labelled multi-hour anomaly events for evaluation.
+
     WHY we inject anomalies:
-      The UCI dataset has natural anomalies but they're unlabeled.
-      For a confusion matrix you need ground truth.
-      We inject on top of the real data so the model still learns real patterns.
-    
-    Two anomaly types:
-      - SPIKE   : sudden 3–5x demand surge (equipment failure, heat wave)
-      - DROPOUT : near-zero demand (outage, sensor failure)
-    
-    Returns modified series + DataFrame of anomaly timestamps + types.
+      Real meter data has no ground-truth fault labels. Injecting on top of
+      real load gives a confusion matrix while the models still learn real
+      patterns.
+
+    Two event types, each lasting 1–6 hours:
+      - SPIKE   : sustained 1.4–2.5× surge (fault current, unmetered load joining)
+      - DROPOUT : partial outage, demand falls to 0–50% (feeder trip, meter fault)
+
+    Magnitudes are deliberately moderate — on smooth aggregate load a 3–5×
+    single-hour spike is trivial to catch and would inflate the scores.
     """
-    n_anomalies = int(len(series) * anomaly_rate)
-    anomaly_indices = rng.choice(len(series), size=n_anomalies, replace=False)
+    n_target = int(len(series) * anomaly_rate)
+    is_anom = np.zeros(len(series), dtype=int)
+    types = np.array(["normal"] * len(series), dtype=object)
+    values = series.values.copy()
 
-    labels = pd.DataFrame(index=series.index)
-    labels["is_anomaly"] = 0
-    labels["anomaly_type"] = "normal"
-
-    result = series.copy()
-    for idx in anomaly_indices:
-        atype = rng.choice(["spike", "dropout"])
-        if atype == "spike":
-            result.iloc[idx] *= rng.uniform(3.0, 5.0)
-            labels.iloc[idx, labels.columns.get_loc("anomaly_type")] = "spike"
+    while is_anom.sum() < n_target:
+        length = int(rng.integers(1, 7))
+        start = int(rng.integers(0, len(series) - length))
+        # keep events separated so each one is a distinct incident
+        if is_anom[max(0, start - 24): start + length + 24].any():
+            continue
+        span = slice(start, start + length)
+        if rng.random() < 0.5:
+            values[span] *= rng.uniform(1.4, 2.5)
+            types[span] = "spike"
         else:
-            result.iloc[idx] *= rng.uniform(0.0, 0.1)
-            labels.iloc[idx, labels.columns.get_loc("anomaly_type")] = "dropout"
-        labels.iloc[idx, labels.columns.get_loc("is_anomaly")] = 1
+            values[span] *= rng.uniform(0.0, 0.5)
+            types[span] = "dropout"
+        is_anom[span] = 1
 
-    return result, labels
+    return pd.Series(values, index=series.index), is_anom, types
 
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -158,36 +207,36 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(RANDOM_SEED)
 
-    base = load_uci_dataset(RAW_DATA_PATH)
+    hourly = select_active_clients(load_hourly_clients(RAW_DATA_PATH))
+    zones = assign_zones(hourly)
 
-    all_zones = {}
-    all_labels = {}
+    combined = {}
+    for zone_id, members in zones.items():
+        clean = fix_dst(hourly[members].sum(axis=1).astype(float))
+        demand, is_anom, types = inject_anomalies(clean, rng, ANOMALY_RATE)
 
-    for zone_id, cfg in ZONE_CONFIG.items():
-        print(f"\nGenerating Zone {zone_id} ({cfg['label']})...")
-        zone_series = add_zone_profile(base, zone_id, rng)
-        zone_series, labels = inject_anomalies(zone_series, rng, anomaly_rate=0.01)
-
-        # Save individual zone
         out = pd.DataFrame({
-            "datetime": zone_series.index,
-            "demand_kwh": zone_series.values,
-            "is_anomaly": labels["is_anomaly"].values,
-            "anomaly_type": labels["anomaly_type"].values,
+            "datetime": demand.index,
+            "demand_kwh": demand.values,
+            # pre-injection load — train.py re-injects fresh anomaly sets
+            # into it for a statistically stable anomaly evaluation
+            "demand_clean_kwh": clean.values,
+            "is_anomaly": is_anom,
+            "anomaly_type": types,
         })
         out.to_csv(OUTPUT_DIR / f"zone_{zone_id}.csv", index=False)
-        print(f"  → Saved zone_{zone_id}.csv | {labels['is_anomaly'].sum()} anomalies injected")
+        n_events = int((np.diff(np.r_[0, is_anom]) == 1).sum())
+        print(f"  → zone_{zone_id}.csv | mean {demand.mean():,.0f} kWh/h | "
+              f"{is_anom.sum()} anomalous hours in {n_events} events")
 
-        all_zones[f"zone_{zone_id}"] = zone_series
-        all_labels[f"zone_{zone_id}_anomaly"] = labels["is_anomaly"]
+        combined[f"zone_{zone_id}"] = demand
+        combined[f"zone_{zone_id}_anomaly"] = is_anom
 
-    # Save combined
-    combined = pd.DataFrame(all_zones)
-    for k, v in all_labels.items():
-        combined[k] = v.values
-    combined.to_csv(OUTPUT_DIR / "combined.csv")
-    print(f"\n✓ Combined dataset saved → {OUTPUT_DIR}/combined.csv")
-    print(f"  Shape: {combined.shape} | Date range: {combined.index[0]} → {combined.index[-1]}")
+    pd.DataFrame(combined).to_csv(OUTPUT_DIR / "combined.csv")
+    with open(OUTPUT_DIR / "zone_clients.json", "w") as f:
+        json.dump({f"zone_{z}": {"label": ZONE_LABELS[z], "clients": m}
+                   for z, m in zones.items()}, f, indent=2)
+    print(f"\n✓ Zones saved → {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
